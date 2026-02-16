@@ -23,7 +23,7 @@ The project leverages several key resources:
 - Python 3.8 or higher
 - Git installed and available in PATH
 - Semgrep CLI installed
-- OpenRouter API key for LLM-based rule evaluation
+- DeepSeek API key for LLM-based rule generation and evaluation
 
 ## Installation
 
@@ -59,9 +59,9 @@ wget https://zenodo.org/records/13983082/files/cvedataset-patches.zip
 unzip cvedataset-patches.zip -d cvedataset-patches
 ```
 
-6. Set up your OpenRouter API key:
+6. Set up your DeepSeek API key:
 ```bash
-export OPENROUTER_API_KEY=your_api_key_here
+export DEEPSEEK_API_KEY=your_api_key_here
 ```
 
 ## Usage

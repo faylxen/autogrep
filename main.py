@@ -225,15 +225,15 @@ def parse_args():
     )
     
     parser.add_argument(
-        "--openrouter-api-key",
-        default=os.environ.get("OPENROUTER_API_KEY"),
-        help="OpenRouter API key (can also be set via OPENROUTER_API_KEY env var)"
+        "--deepseek-api-key",
+        default=os.environ.get("DEEPSEEK_API_KEY"),
+        help="DeepSeek API key (can also be set via DEEPSEEK_API_KEY env var)"
     )
-    
+
     parser.add_argument(
-        "--openrouter-base-url",
-        default="https://openrouter.ai/api/v1",
-        help="OpenRouter API base URL"
+        "--deepseek-base-url",
+        default="https://api.deepseek.com",
+        help="DeepSeek API base URL"
     )
     
     parser.add_argument(
@@ -245,8 +245,8 @@ def parse_args():
     
     args = parser.parse_args()
     
-    if not args.openrouter_api_key:
-        parser.error("OpenRouter API key must be provided via --openrouter-api-key or OPENROUTER_API_KEY env var")
+    if not args.deepseek_api_key:
+        parser.error("DeepSeek API key must be provided via --deepseek-api-key or DEEPSEEK_API_KEY env var")
     
     return args
 
@@ -267,8 +267,8 @@ def main():
         repos_cache_dir=args.repos_cache_dir,
         max_files_changed=args.max_files_changed,
         max_retries=args.max_retries,
-        openrouter_api_key=args.openrouter_api_key,
-        openrouter_base_url=args.openrouter_base_url
+        deepseek_api_key=args.deepseek_api_key,
+        deepseek_base_url=args.deepseek_base_url
     )
     
     # Create necessary directories

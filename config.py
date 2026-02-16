@@ -11,8 +11,8 @@ class Config:
     repos_cache_dir: Path = Path("cache/repos")
     max_files_changed: int = 1
     max_retries: int = 8
-    openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY")
-    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    deepseek_api_key: str = os.getenv("DEEPSEEK_API_KEY")
+    deepseek_base_url: str = "https://api.deepseek.com"
     cache_manager: CacheManager = field(init=False)
 
     def __post_init__(self):

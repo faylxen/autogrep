@@ -25,7 +25,7 @@ class RuleFilter:
     def __init__(self, input_dir: Path, output_dir: Path, model_name: str = 'all-MiniLM-L6-v2'):
         self.input_dir = input_dir
         self.output_dir = output_dir
-        self.client = OpenAI(api_key= os.getenv("OPENROUTER_API_KEY"), base_url="https://openrouter.ai/api/v1")  # Still needed for rule quality evaluation
+        self.client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")
         self.stats = defaultdict(RuleStats)
         self.embeddings_cache = {}
         
@@ -175,7 +175,7 @@ First line: ACCEPT or REJECT
 Second line: Brief reason specifically mentioning if it uses project-specific code or standard libraries"""
 
             response = self.client.chat.completions.create(
-                model="deepseek/deepseek-chat",
+                model="deepseek-chat",
                 messages=[
                     {"role": "system", "content": "You are a security expert evaluating Semgrep rules."},
                     {"role": "user", "content": prompt}

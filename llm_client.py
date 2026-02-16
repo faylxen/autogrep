@@ -11,8 +11,8 @@ class LLMClient:
     def __init__(self, config: Config):
         self.config = config
         self.client = OpenAI(
-            api_key=config.openrouter_api_key,
-            base_url=config.openrouter_base_url
+            api_key=config.deepseek_api_key,
+            base_url=config.deepseek_base_url
         )
         
     def extract_response(self, text: str) -> str:
@@ -123,7 +123,7 @@ class LLMClient:
         
         try:
             response = self.client.chat.completions.create(
-                model="deepseek/deepseek-chat",
+                model="deepseek-chat",
                 messages=[
                     {"role": "system", "content": """You generate Semgrep rules in YAML format. 
     Return only the raw YAML content without any markdown formatting or additional text.
