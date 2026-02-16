@@ -225,28 +225,38 @@ def parse_args():
     )
     
     parser.add_argument(
-        "--deepseek-api-key",
-        default=os.environ.get("DEEPSEEK_API_KEY"),
-        help="DeepSeek API key (can also be set via DEEPSEEK_API_KEY env var)"
+        "--llm-provider",
+        default=os.environ.get("LLM_PROVIDER", "anthropic"),
+        choices=["anthropic", "deepseek", "openai"],
+        help="LLM provider (default: anthropic)"
     )
 
     parser.add_argument(
-        "--deepseek-base-url",
-        default="https://api.deepseek.com",
-        help="DeepSeek API base URL"
+        "--llm-api-key",
+        default=None,
+        help="LLM API key (defaults to provider-specific env var: ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, OPENAI_API_KEY)"
     )
-    
+
+    parser.add_argument(
+        "--llm-model",
+        default="",
+        help="LLM model name (default: auto based on provider)"
+    )
+
+    parser.add_argument(
+        "--llm-base-url",
+        default="",
+        help="LLM API base URL (default: auto based on provider)"
+    )
+
     parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Logging level"
     )
-    
+
     args = parser.parse_args()
-    
-    if not args.deepseek_api_key:
-        parser.error("DeepSeek API key must be provided via --deepseek-api-key or DEEPSEEK_API_KEY env var")
     
     return args
 
@@ -267,8 +277,10 @@ def main():
         repos_cache_dir=args.repos_cache_dir,
         max_files_changed=args.max_files_changed,
         max_retries=args.max_retries,
-        deepseek_api_key=args.deepseek_api_key,
-        deepseek_base_url=args.deepseek_base_url
+        llm_provider=args.llm_provider,
+        llm_api_key=args.llm_api_key or "",
+        llm_model=args.llm_model,
+        llm_base_url=args.llm_base_url
     )
     
     # Create necessary directories

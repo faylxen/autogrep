@@ -1,18 +1,20 @@
 from typing import Optional, Tuple
 from config import Config
+from llm_provider import LLMProvider
 import logging
 import yaml
 from patch_processor import PatchInfo
 import re
-from openai import OpenAI
 from pathlib import Path
 
 class LLMClient:
     def __init__(self, config: Config):
         self.config = config
-        self.client = OpenAI(
-            api_key=config.deepseek_api_key,
-            base_url=config.deepseek_base_url
+        self.llm = LLMProvider(
+            provider=config.llm_provider,
+            api_key=config.llm_api_key,
+            model=config.llm_model,
+            base_url=config.llm_base_url,
         )
         
     def extract_response(self, text: str) -> str:
@@ -122,25 +124,18 @@ class LLMClient:
         prompt = self._build_prompt(patch_info, error_feedback)
         
         try:
-            response = self.client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": """You generate Semgrep rules in YAML format. 
+            system_prompt = """You generate Semgrep rules in YAML format.
     Return only the raw YAML content without any markdown formatting or additional text.
-    Always include these required fields: id, pattern, message, severity, languages"""},
-                    {"role": "user", "content": prompt}
-                ],
+    Always include these required fields: id, pattern, message, severity, languages"""
+
+            content = self.llm.chat_completion(
+                system=system_prompt,
+                user=prompt,
                 temperature=0.6,
             )
-            
-            if not response.choices:
-                logging.error("No response generated from LLM")
-                return None
-            
-            # Extract and clean the response
-            content = response.choices[0].message.content
+
             if not content:
-                logging.error("Empty response from LLM")
+                logging.error("No response generated from LLM")
                 return None
                 
             rule_text = self.extract_response(content)

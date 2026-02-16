@@ -23,7 +23,7 @@ The project leverages several key resources:
 - Python 3.8 or higher
 - Git installed and available in PATH
 - Semgrep CLI installed
-- DeepSeek API key for LLM-based rule generation and evaluation
+- An LLM API key (Anthropic by default, also supports DeepSeek and OpenAI)
 
 ## Installation
 
@@ -59,9 +59,13 @@ wget https://zenodo.org/records/13983082/files/cvedataset-patches.zip
 unzip cvedataset-patches.zip -d cvedataset-patches
 ```
 
-6. Set up your DeepSeek API key:
+6. Set up your LLM API key (Anthropic/Claude by default):
 ```bash
-export DEEPSEEK_API_KEY=your_api_key_here
+export ANTHROPIC_API_KEY=your_api_key_here
+
+# Or use a different provider:
+# export LLM_PROVIDER=deepseek
+# export DEEPSEEK_API_KEY=your_api_key_here
 ```
 
 ## Usage
@@ -101,6 +105,7 @@ autogrep/
 ├── main.py                 # Main rule generation script
 ├── rule_filter.py         # Rule filtering and quality control
 ├── config.py             # Configuration and settings
+├── llm_provider.py       # LLM provider abstraction layer
 ├── llm_client.py         # LLM integration for rule generation
 ├── patch_processor.py    # Patch file processing
 ├── rule_validator.py     # Rule validation logic

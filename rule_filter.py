@@ -10,7 +10,7 @@ import torch
 from collections import defaultdict
 import shutil
 import json
-from openai import OpenAI
+from llm_provider import LLMProvider
 import os
 
 @dataclass
@@ -25,7 +25,7 @@ class RuleFilter:
     def __init__(self, input_dir: Path, output_dir: Path, model_name: str = 'all-MiniLM-L6-v2'):
         self.input_dir = input_dir
         self.output_dir = output_dir
-        self.client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")
+        self.llm = LLMProvider()
         self.stats = defaultdict(RuleStats)
         self.embeddings_cache = {}
         
@@ -174,19 +174,16 @@ Respond with exactly two lines:
 First line: ACCEPT or REJECT
 Second line: Brief reason specifically mentioning if it uses project-specific code or standard libraries"""
 
-            response = self.client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": "You are a security expert evaluating Semgrep rules."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2
+            content = self.llm.chat_completion(
+                system="You are a security expert evaluating Semgrep rules.",
+                user=prompt,
+                temperature=0.2,
             )
-            
-            if not response.choices:
+
+            if not content:
                 return False, "No response from LLM"
-                
-            lines = response.choices[0].message.content.strip().split('\n')
+
+            lines = content.strip().split('\n')
             decision = lines[0].strip().upper() == 'ACCEPT'
             reason = lines[1].strip() if len(lines) > 1 else "Unknown reason"
             
