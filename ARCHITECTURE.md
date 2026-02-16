@@ -2,7 +2,7 @@
 
 ## Vue d'ensemble
 
-Pipeline local automatisé : une CVE entre, une règle Semgrep validée sort.
+Pipeline automatisé : une CVE entre, une règle Semgrep validée sort.
 
 ```
 CVE-ID
@@ -124,43 +124,132 @@ Total maximum absolu : 8 tentatives tous types confondus (circuit breaker).
 
 ---
 
-## Stack technique — tout local
+## Stack technique
 
-### Orchestration : Prefect (self-hosted)
+### Pourquoi LangGraph (et pas LangChain)
 
-Pourquoi : tasks décorées en Python, UI web pour suivre les runs, retry/caching natifs, pas de broker externe requis.
+**LangChain : non pertinent ici.**
+LangChain est une couche d'abstraction sur les appels LLM linéaires (prompt → call → parse).
+Le code existant fait déjà ça directement via l'API OpenAI-compatible. LangChain ajouterait
+de la complexité et des dépendances sans valeur — le pipeline n'est pas linéaire, c'est un
+**graphe avec des cycles**. LangChain ne gère pas les boucles conditionnelles.
 
-```bash
-pip install prefect
-prefect server start  # → http://localhost:4200
+**LangGraph : directement pertinent.**
+LangGraph est conçu pour les workflows **stateful avec des boucles et des branchements conditionnels**.
+C'est exactement le pattern Generator ↔ Critic avec ses deux boucles de feedback.
+
+Apports concrets de LangGraph pour ce projet :
+
+| Feature LangGraph | Utilisation dans AutoGrep |
+|-------------------|--------------------------|
+| **State typé** (`TypedDict`) | L'état complet du pipeline (CVE enrichi, historique multi-turn, compteurs de retry par type, rule courante) vit dans un objet State unique, passé entre tous les nodes |
+| **Conditional edges** | `critic_node` → si ACCEPT → `execute_node`, si REJECT → `generate_node`. Plus besoin de `while/if` manuels |
+| **Checkpointing** | Si le pipeline crash (rate limit API, timeout git clone), il reprend exactement où il en était. Checkpointer PostgreSQL ou SQLite |
+| **Subgraphs** | La boucle interne (Generator ↔ Critic) peut être un subgraph encapsulé, réutilisable et testable isolément |
+| **Streaming** | Voir en temps réel ce que le generator produit, utile pour le debug |
+
+Le graphe LangGraph :
+
+```python
+from langgraph.graph import StateGraph, END
+
+graph = StateGraph(PipelineState)
+
+graph.add_node("enrich",    enrich_node)
+graph.add_node("generate",  generate_node)
+graph.add_node("critic",    critic_node)
+graph.add_node("execute",   execute_node)
+graph.add_node("classify",  classify_node)
+graph.add_node("store",     store_node)
+
+graph.set_entry_point("enrich")
+graph.add_edge("enrich", "generate")
+graph.add_edge("generate", "critic")
+
+# ── Boucle interne : Critic décide ──
+graph.add_conditional_edges("critic", route_after_critic, {
+    "accepted":     "execute",
+    "rejected":     "generate",   # ← reboucle
+    "budget_spent": END,
+})
+
+graph.add_edge("execute", "classify")
+
+# ── Boucle externe : Classification décide ──
+graph.add_conditional_edges("classify", route_after_classify, {
+    "success":       "store",
+    "retry":         "generate",   # ← reboucle avec feedback
+    "fix_local":     "execute",    # ← re-execute sans re-generate
+    "skip":          END,
+    "budget_spent":  END,
+})
+
+graph.add_edge("store", END)
+
+app = graph.compile(checkpointer=PostgresSaver(...))
 ```
 
-Chaque CVE = un flow. Chaque étape = une task. Les retries sont visibles dans l'UI.
+Le `PipelineState` contient tout :
 
-Pattern Prefect à utiliser :
-- `@task(retries=N)` pour les appels réseau (NVD, git clone)
-- `@task(cache_key_fn=task_input_hash)` pour l'enrichissement (même CVE = même résultat)
-- `@flow` pour le pipeline principal avec la boucle while
-- `create_markdown_artifact()` pour logger la règle finale dans l'UI Prefect
-
-### LLM local : Ollama
-
-```bash
-ollama serve                           # → http://localhost:11434
-ollama pull deepseek-coder-v2:16b      # Generator
-ollama pull llama3.1:8b                # Critic (plus léger, plus rapide)
-ollama pull nomic-embed-text           # Embeddings pour la déduplication
+```python
+class PipelineState(TypedDict):
+    cve_id: str
+    enriched: EnrichedCVE           # Données enrichies (NVD, OSV, patch, etc.)
+    current_rule: Optional[dict]    # Règle YAML courante
+    messages: list[dict]            # Historique multi-turn complet
+    retry_budgets: dict[str, int]   # Compteurs par type d'erreur
+    total_attempts: int             # Circuit breaker global
+    critic_score: Optional[int]     # Dernier score du critic
+    semgrep_result: Optional[dict]  # Dernière sortie Semgrep
+    error_type: Optional[str]       # Dernier type d'erreur classifié
+    temperature: float              # Temperature adaptative courante
 ```
 
-L'API est compatible OpenAI — le code existant qui utilise `openai.OpenAI(base_url=...)` marche tel quel en changeant juste l'URL.
+### LLMs externes via OpenRouter
 
-Deux modèles séparés pour generator et critic :
-- **Generator** : modèle plus gros (deepseek-coder-v2:16b) car il doit produire du YAML Semgrep correct
-- **Critic** : modèle plus léger (llama3.1:8b) car il fait du jugement binaire, pas de génération complexe
+OpenRouter comme routeur unifié — une seule API, accès à tous les providers.
+Le code existant utilise déjà `openai.OpenAI(base_url=openrouter_base_url)`, rien à changer côté client.
+
+Choix des modèles par rôle :
+
+| Rôle | Modèle recommandé | Pourquoi |
+|------|-------------------|----------|
+| **Generator** | `deepseek/deepseek-chat` ou `anthropic/claude-sonnet-4-5-20250929` | Doit produire du YAML Semgrep syntaxiquement correct avec des patterns complexes. Besoin de capacité de raisonnement sur le code |
+| **Critic** | `anthropic/claude-haiku-4-5-20251001` ou `google/gemini-2.0-flash` | Jugement structuré, pas de génération complexe. Modèle rapide et cheap suffisant |
+| **Enrichment summarizer** | `anthropic/claude-haiku-4-5-20251001` | Synthèse de texte, pas de code. Le plus cheap possible |
+| **Embeddings** | `openai/text-embedding-3-small` via OpenAI direct | Meilleur rapport qualité/prix pour la déduplication |
+
+Configuration :
+
+```python
+@dataclass
+class LLMConfig:
+    # OpenRouter pour les LLMs de génération/critique
+    openrouter_api_key: str
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+
+    generator_model: str = "deepseek/deepseek-chat"
+    critic_model: str = "anthropic/claude-haiku-4-5-20251001"
+    summarizer_model: str = "anthropic/claude-haiku-4-5-20251001"
+
+    # OpenAI direct pour les embeddings (ou via OpenRouter)
+    embedding_model: str = "text-embedding-3-small"
+    embedding_api_key: str = ""  # si via OpenAI direct
+
+    # Fallback : si un provider est down, OpenRouter route automatiquement
+    # Mais on peut aussi configurer un fallback explicite :
+    generator_fallback: str = "anthropic/claude-sonnet-4-5-20250929"
+```
+
+Avantage d'OpenRouter : **fallback automatique**. Si DeepSeek est down, on peut switcher
+sur Claude Sonnet sans changer le code. Un seul `base_url`, une seule clé API.
+
+Rate limiting : OpenRouter gère le rate limiting côté serveur. Côté client,
+ajouter un simple retry exponentiel (déjà le pattern dans le code existant avec `max_retries`).
 
 ### Monitoring LLM : LangFuse (self-hosted via Docker)
 
-Pourquoi : traces chaque appel LLM (latence, tokens, prompt, réponse), versionne les prompts, permet de scorer les sorties.
+Pourquoi : trace chaque appel LLM (latence, tokens, coût, prompt, réponse), versionne les prompts, permet de scorer les sorties.
 
 ```yaml
 # docker-compose
@@ -171,14 +260,27 @@ services:
     depends_on: [postgres]
 ```
 
-Intégration via le decorator `@observe()` de langfuse. Drop-in sur les fonctions existantes.
+Intégration native avec LangGraph via le callback handler LangFuse.
+Chaque node du graphe apparaît comme un span dans la trace.
+
+```python
+from langfuse.callback import CallbackHandler
+
+langfuse_handler = CallbackHandler(
+    public_key="...", secret_key="...", host="http://localhost:3000"
+)
+
+# Passer le handler à chaque invocation LangGraph
+result = app.invoke(initial_state, config={"callbacks": [langfuse_handler]})
+```
 
 Ce qu'on monitore :
-- Tokens consommés par CVE (coût même en local → permet d'estimer si on scale)
-- Taux ACCEPT/REJECT du critic
+- **Coût réel par CVE** (OpenRouter renvoie le prix dans les headers)
+- Taux ACCEPT/REJECT du critic (score dans LangFuse)
 - Nombre moyen de boucles avant convergence
-- Latence par étape
-- Prompts versionnés (A/B testing de prompts)
+- Latence par node du graphe
+- Prompts versionnés (A/B testing via LangFuse Prompt Management)
+- Comparaison de performance entre modèles (DeepSeek vs Claude Sonnet en generator)
 
 ### Base de données : PostgreSQL + pgvector
 
@@ -186,18 +288,19 @@ Remplace les fichiers JSON/YAML actuels. Permet :
 - Requêtes sur les règles par CVE, CWE, langage, score de qualité
 - Déduplication par similarité vectorielle directement en SQL (`<=>` operator de pgvector)
 - Historique de toutes les tentatives (pas juste le résultat final)
+- Sert aussi de checkpointer pour LangGraph (persistence du state entre les runs)
 - Partagé avec LangFuse (même instance PostgreSQL)
 
 Tables essentielles : `cves`, `patches`, `rules`, `pipeline_runs`, `critic_evaluations`.
 
-### Embeddings : pgvector + Ollama
+### Embeddings : pgvector + API externe
 
 Remplace `sentence-transformers` en mémoire. Les embeddings sont :
-1. Générés via Ollama (`nomic-embed-text`)
-2. Stockés dans PostgreSQL (`vector(768)`)
+1. Générés via l'API OpenAI (`text-embedding-3-small`, 1536 dims) ou OpenRouter
+2. Stockés dans PostgreSQL (`vector(1536)`)
 3. Comparés en SQL : `SELECT * FROM rules WHERE embedding <=> $1 < 0.1`
 
-Plus besoin de tout charger en RAM pour la déduplication.
+Plus besoin de charger un modèle en RAM pour la déduplication.
 
 ---
 
@@ -357,12 +460,22 @@ function process_cve(cve_id):
 
 | Composant | Outil | Rôle |
 |-----------|-------|------|
-| Orchestration | **Prefect** | Flows, tasks, retries, UI, scheduling |
-| LLM Generator | **Ollama** (deepseek-coder-v2:16b) | Génération de règles |
-| LLM Critic | **Ollama** (llama3.1:8b) | Evaluation qualité + pertinence |
-| Embeddings | **Ollama** (nomic-embed-text) | Déduplication |
-| Monitoring | **LangFuse** (self-hosted) | Traces, tokens, scores, prompts |
-| Database | **PostgreSQL + pgvector** | CVEs, rules, embeddings, runs |
+| Orchestration / Graphe | **LangGraph** | State machine avec boucles, conditional edges, checkpointing |
+| LLM Generator | **OpenRouter** → DeepSeek Chat / Claude Sonnet | Génération de règles Semgrep |
+| LLM Critic | **OpenRouter** → Claude Haiku / Gemini Flash | Evaluation qualité + pertinence |
+| Embeddings | **OpenAI** → text-embedding-3-small | Déduplication vectorielle |
+| Monitoring | **LangFuse** (self-hosted) | Traces, tokens, coûts, scores, prompts |
+| Database | **PostgreSQL + pgvector** | CVEs, rules, embeddings, runs, checkpoints |
 | Validation | **Semgrep CLI** | Exécution des règles sur le code |
 | Git | **GitPython** | Clone, checkout, diff |
 | CVE Data | **NVD + OSV + GitHub Advisory** | Enrichissement |
+
+### Pourquoi pas LangChain ?
+
+Pour résumer la décision en une phrase :
+**LangChain** abstrait les appels LLM linéaires (prompt → call → parse) — ce que le code fait déjà.
+**LangGraph** structure les workflows à boucles et branchements — ce qui manque au code actuel.
+
+Le pipeline AutoGrep n'est pas une chaîne, c'est un graphe cyclique. LangGraph modélise
+exactement ça. LangChain serait une couche d'abstraction inutile par-dessus l'API OpenAI-compatible
+déjà en place.
