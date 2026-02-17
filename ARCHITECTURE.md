@@ -8,17 +8,16 @@ L'utilisateur donne son code en ZIP. AutoGrep identifie les dépendances vulnér
  Code ZIP (user)
       │
       ▼
-┌────────────┐    ┌──────────┐    ┌───────────┐    ┌──────────┐    ┌──────────┐    ┌─────────┐
-│ EXTRACT    │───▶│ DEP      │───▶│ GENERATE  │◀──▶│ CRITIC   │───▶│ EXECUTE  │───▶│ RETURN  │
-│ /cachecode │    │ TRACK    │    │           │    │          │    │ Semgrep  │    │ règles  │
-└────────────┘    └──────────┘    └─────▲─────┘    └──────────┘    └────┬─────┘    └─────────┘
-                       │                │                               │
-                       │ CVE list       │         ┌──────────┐          │
-                       │                └─────────│ CLASSIFY │◀─────────┘
-                       │                          │ ERROR    │
-                       ▼                          └──────────┘
-              Patch fetch
-              (git commit)
+┌────────────┐    ┌──────────┐    ┌──────────┐    ┌───────────┐    ┌──────────┐    ┌──────────┐    ┌─────────┐
+│ EXTRACT    │───▶│ DEP      │───▶│ ENRICH   │───▶│ GENERATE  │◀──▶│ CRITIC   │───▶│ EXECUTE  │───▶│ RETURN  │
+│ /cachecode │    │ TRACK    │    │ (LLM)    │    │           │    │          │    │ Semgrep  │    │ règles  │
+└────────────┘    └──────────┘    └──────────┘    └─────▲─────┘    └──────────┘    └────┬─────┘    └─────────┘
+                       │                                │                               │
+                       │ CVE list                       │         ┌──────────┐          │
+                       │                                └─────────│ CLASSIFY │◀─────────┘
+                       ▼                                          │ ERROR    │
+                  DT + MoreFixes                                  └──────────┘
+                  (données brutes)
 ```
 
 Pipeline linéaire par CVE : **une CVE → une règle**. Le résultat final est l'ensemble des règles Semgrep validées.
@@ -66,15 +65,30 @@ Les 3 sources sont interrogées et les résultats sont agrégés : on prend le C
 
 Output : liste de CVEs avec pour chacune le package affecté, la version vulnérable, le CWE, et le(s) commit(s) de fix.
 
-### 3. Patch fetch
+### 3. Enrichissement LLM (par CVE)
 
-Pour chaque CVE, récupération du patch depuis le commit de fix :
-- Clone/cache du repo source dans `cache/repos/`
-- `git diff <parent>..<commit>` pour extraire le diff
+C'est un **agent LLM**, pas un script déterministe. On lui donne tout ce qu'on a (données du dep track + MoreFixes) et il se débrouille pour assembler un dossier complet sur la vulnérabilité.
+
+**Input** : données brutes du dependency tracking (CVE-ID, package, version, CWE, description NVD, références) + données MoreFixes si disponibles.
+
+**Ce que le LLM fait** :
+- Cherche le **commit de fix** dans les références, sur internet, dans les changelogs
+- Identifie les **fichiers et méthodes vulnérables**
+- Récupère le **git diff** (via tool calling / function calling)
+- Cherche des **infos complémentaires** sur internet (writeups, advisories, PoCs)
+- Compile un **dossier structuré** avec tout ce qui peut aider à comprendre la vuln et la retrouver dans du code
+
+**Output** : un objet enrichi contenant :
+- Le diff du patch (code vulnérable vs code fixé)
+- Les fichiers et fonctions affectés
+- Le type de vulnérabilité et le pattern de code dangereux
+- Le contexte nécessaire pour qu'un LLM generator puisse produire une règle Semgrep pertinente
+
+Le LLM d'enrichissement a accès à des **tools** : recherche web, git clone, git diff, lecture de fichiers, API GitHub. C'est un agent autonome qui explore jusqu'à avoir assez d'info.
 
 ### 4. Génération de règle (par CVE)
 
-Le pipeline Generator → Critic → Execute produit une règle Semgrep validée. Détail dans les sections ci-dessous.
+Le pipeline Generator → Critic → Execute produit une règle Semgrep validée. Le generator reçoit le dossier complet de l'étape d'enrichissement. Détail dans les sections ci-dessous.
 
 ### 5. Résultat
 
@@ -189,13 +203,15 @@ from langgraph.graph import StateGraph, END
 
 graph = StateGraph(PipelineState)
 
+graph.add_node("enrich",    enrich_node)     # Agent LLM avec tools
 graph.add_node("generate",  generate_node)
 graph.add_node("critic",    critic_node)
 graph.add_node("execute",   execute_node)
 graph.add_node("classify",  classify_node)
 graph.add_node("store",     store_node)
 
-graph.set_entry_point("generate")
+graph.set_entry_point("enrich")
+graph.add_edge("enrich", "generate")
 graph.add_edge("generate", "critic")
 
 # Boucle interne : Critic décide
@@ -226,6 +242,7 @@ Le `PipelineState` :
 ```python
 class PipelineState(TypedDict):
     cve_id: str
+    enriched: EnrichedCVE           # Dossier complet de l'enrichissement LLM
     patch_diff: str                 # Diff du commit de fix
     repo_path: str                  # Chemin du repo cloné
     current_rule: Optional[dict]    # Règle YAML courante
@@ -244,6 +261,7 @@ Chaque provider est appelé directement via son SDK, sans intermédiaire.
 
 | Rôle | Modèle recommandé | Provider | Pourquoi |
 |------|-------------------|----------|----------|
+| **Enrichissement** | `claude-sonnet-4-5-20250929` ou `deepseek-chat` | Anthropic / DeepSeek | Agent avec tools, doit raisonner et explorer de manière autonome |
 | **Generator** | `deepseek-chat` ou `claude-sonnet-4-5-20250929` | DeepSeek / Anthropic | Doit produire du YAML Semgrep correct avec des patterns complexes |
 | **Critic** | `claude-haiku-4-5-20251001` ou `gemini-2.0-flash` | Anthropic / Google | Jugement structuré, modèle rapide et cheap suffisant |
 
@@ -252,6 +270,11 @@ Configuration :
 ```python
 @dataclass
 class LLMConfig:
+    # Enrichissement (agent avec tools)
+    enrich_provider: str = "anthropic"
+    enrich_model: str = "claude-sonnet-4-5-20250929"
+    enrich_api_key: str = ""
+
     # Generator
     generator_provider: str = "deepseek"        # deepseek | anthropic | openai
     generator_model: str = "deepseek-chat"
@@ -333,30 +356,61 @@ GET https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-2024-XXXXX
 
 Les résultats sont agrégés : CWE et CVSS de NVD, commits de fix de GitHub Advisory / OSV, versions affectées d'OSV.
 
-### Step 3 — PATCH FETCH
+### Step 3 — ENRICH (agent LLM)
 
-**Input** : commit de fix (depuis OSV/GitHub Advisory)
-**Output** : diff du patch
+**Input** : données brutes du dep track + MoreFixes (CVE-ID, package, version, CWE, description, références)
+**Output** : dossier enrichi complet sur la vulnérabilité
 
-```python
-# Clone/cache le repo source
-git clone https://github.com/{owner}/{repo} cache/repos/{owner}_{repo}
+Le LLM d'enrichissement est un **agent avec tools**. Il reçoit tout ce qu'on a et cherche ce qui manque :
 
-# Extraire le diff
-git diff {parent_commit}..{fix_commit}
+```
+Tools disponibles :
+├── web_search(query)              → recherche internet (writeups, advisories, PoCs)
+├── git_clone(repo_url)            → clone un repo dans cache/repos/
+├── git_diff(repo, commit)         → extrait le diff d'un commit de fix
+├── read_file(repo, path, commit)  → lit un fichier à un commit donné
+├── github_api(endpoint)           → appels API GitHub (commits, PRs, issues)
+└── fetch_url(url)                 → récupère le contenu d'une URL
 ```
 
-Les repos sont cachés dans `cache/repos/` pour ne pas recloner.
+L'agent explore de manière autonome :
+1. Part des références de la CVE (NVD, GHSA, OSV, MoreFixes)
+2. Trouve le commit de fix (ou les commits)
+3. Récupère le git diff
+4. Identifie les fichiers et fonctions vulnérables
+5. Cherche du contexte additionnel si nécessaire (writeups, issues, changelogs)
+6. Compile un dossier structuré
+
+**Output structuré** :
+
+```python
+@dataclass
+class EnrichedCVE:
+    cve_id: str
+    package: str
+    version: str
+    cwe: str
+    description: str                # Description de la vuln
+    patch_diff: str                 # Git diff du fix
+    vulnerable_files: list[str]     # Fichiers affectés
+    vulnerable_functions: list[str] # Fonctions/méthodes affectées
+    language: str                   # Langage principal
+    fix_commit: str                 # Hash du commit de fix
+    repo_url: str                   # URL du repo source
+    context: str                    # Contexte additionnel (writeups, etc.)
+```
 
 ### Step 4 — GENERATE
 
-**Input** : patch diff + feedback optionnel (du critic ou de l'exécution)
+**Input** : dossier enrichi (EnrichedCVE) + feedback optionnel (du critic ou de l'exécution)
 **Output** : règle Semgrep en YAML
 
-Le prompt reçoit :
-- La description de la CVE (depuis OSV)
-- Le CWE (depuis OSV/NVD)
+Le prompt reçoit tout le dossier de l'enrichissement :
+- La description de la vulnérabilité
+- Le CWE
 - Le diff du patch
+- Les fichiers et fonctions vulnérables
+- Le contexte additionnel
 - Les exemples Semgrep pour le langage cible
 - L'historique complet des tentatives précédentes (multi-turn)
 
@@ -405,13 +459,17 @@ La règle finale est stockée et renvoyée. Le pipeline s'arrête ici — pas de
 ## La boucle de génération — pseudocode
 
 ```
-function process_cve(cve_id, patch_diff, repo_path):
+function process_cve(cve_id, raw_data):
+    // Step 1 : Enrichissement LLM (agent avec tools)
+    enriched = enrich_agent(cve_id, raw_data)
+    // enriched contient : patch_diff, fichiers vulnérables, fonctions, contexte, repo_path
+
     feedback = null
     history = []
 
     for attempt in 1..MAX_ATTEMPTS:
 
-        rule = generate(patch_diff, history, feedback)
+        rule = generate(enriched, history, feedback)
 
         if rule is null:
             feedback = {type: "generation_failed", msg: "..."}
@@ -429,7 +487,7 @@ function process_cve(cve_id, patch_diff, repo_path):
             continue
 
         // Le critic a ACCEPT → on exécute
-        semgrep_result = execute_semgrep(rule, repo_path, patch_diff)
+        semgrep_result = execute_semgrep(rule, enriched.repo_path, enriched.patch_diff)
         error_type, error_msg = classify_error(semgrep_result)
 
         if error_type is null:
@@ -461,11 +519,12 @@ function process_cve(cve_id, patch_diff, repo_path):
 | Composant | Outil | Rôle |
 |-----------|-------|------|
 | Orchestration | **LangGraph** | State machine avec boucles, conditional edges, checkpointing |
+| LLM Enrichissement | **Anthropic** / **DeepSeek** (agent avec tools) | Recherche commit, diff, fichiers vulnérables, contexte |
 | LLM Generator | **DeepSeek** / **Anthropic** (appels directs) | Génération de règles Semgrep |
 | LLM Critic | **Anthropic** / **Google** (appels directs) | Evaluation qualité + pertinence |
 | Monitoring | **LangFuse** (self-hosted) | Traces, tokens, coûts, scores |
 | Database | **SQLite** (dev) / **PostgreSQL** (prod) | Runs, checkpoints, règles |
 | Validation | **Semgrep CLI** | Exécution des règles sur le code |
-| Git | **GitPython** | Clone, checkout, diff |
-| CVE Data | **NVD** + **GitHub Advisory** + **OSV** | Dependency tracking agrégé, patch discovery |
+| Git | **GitPython** | Clone, checkout, diff (utilisé par l'agent d'enrichissement) |
+| CVE Data | **NVD** + **GitHub Advisory** + **OSV** + **MoreFixes** | Dependency tracking agrégé, données brutes |
 | Code Input | **ZIP upload** → `/cachecode/` | Code utilisateur pour dependency tracking |
