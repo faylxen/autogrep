@@ -2,26 +2,26 @@
 
 ## Vue d'ensemble
 
-L'utilisateur donne son code en ZIP. AutoGrep identifie les dépendances vulnérables, génère une règle Semgrep par CVE, et scanne le code.
+L'utilisateur donne son code en ZIP. AutoGrep identifie les dépendances vulnérables, génère une règle Semgrep par CVE, et renvoie les règles.
 
 ```
  Code ZIP (user)
       │
       ▼
-┌────────────┐    ┌──────────┐    ┌───────────┐    ┌──────────┐    ┌──────────┐    ┌────────┐
-│ EXTRACT    │───▶│ DEP      │───▶│ GENERATE  │◀──▶│ CRITIC   │───▶│ EXECUTE  │───▶│ SCAN   │
-│ /cachecode │    │ TRACK    │    │           │    │          │    │ Semgrep  │    │ user   │
-└────────────┘    └──────────┘    └─────▲─────┘    └──────────┘    └────┬─────┘    └────────┘
+┌────────────┐    ┌──────────┐    ┌───────────┐    ┌──────────┐    ┌──────────┐    ┌─────────┐
+│ EXTRACT    │───▶│ DEP      │───▶│ GENERATE  │◀──▶│ CRITIC   │───▶│ EXECUTE  │───▶│ RETURN  │
+│ /cachecode │    │ TRACK    │    │           │    │          │    │ Semgrep  │    │ règles  │
+└────────────┘    └──────────┘    └─────▲─────┘    └──────────┘    └────┬─────┘    └─────────┘
                        │                │                               │
                        │ CVE list       │         ┌──────────┐          │
                        │                └─────────│ CLASSIFY │◀─────────┘
                        │                          │ ERROR    │
                        ▼                          └──────────┘
-                  Patch fetch
-                  (git commit)
+              Patch fetch
+              (git commit)
 ```
 
-Pipeline linéaire par CVE : **une CVE → une règle**.
+Pipeline linéaire par CVE : **une CVE → une règle**. Le résultat final est l'ensemble des règles Semgrep validées.
 
 Deux boucles de feedback pour la génération :
 
@@ -54,11 +54,17 @@ Analyse des fichiers de dépendances dans `/cachecode` pour identifier les CVEs 
 | Ruby       | `Gemfile.lock` |
 | Rust       | `Cargo.lock` |
 
-Sources de données CVE :
-- **OSV API** (`api.osv.dev/v1/query`) — requête par package + version
-- **GitHub Advisory Database** (`gh api /advisories`) — fallback
+Le dependency tracking agrège 3 sources de données CVE :
 
-Output : liste de CVEs avec pour chacune le package affecté, la version vulnérable, et le(s) commit(s) de fix.
+| Source | API | Ce qu'elle apporte |
+|--------|-----|-------------------|
+| **NVD** (NIST) | `services.nvd.nist.gov/rest/json/cves/2.0` | CWE, CVSS score, description officielle |
+| **GitHub Advisory** | `api.github.com/advisories` | Commits de fix, packages affectés, écosystème |
+| **OSV** (Google) | `api.osv.dev/v1/query` | Versions affectées, fix commits, couverture multi-écosystème |
+
+Les 3 sources sont interrogées et les résultats sont agrégés : on prend le CWE de NVD, les commits de fix de GitHub Advisory / OSV, et les versions affectées d'OSV.
+
+Output : liste de CVEs avec pour chacune le package affecté, la version vulnérable, le CWE, et le(s) commit(s) de fix.
 
 ### 3. Patch fetch
 
@@ -70,15 +76,14 @@ Pour chaque CVE, récupération du patch depuis le commit de fix :
 
 Le pipeline Generator → Critic → Execute produit une règle Semgrep validée. Détail dans les sections ci-dessous.
 
-### 5. Scan du code utilisateur
+### 5. Résultat
 
-Toutes les règles validées sont exécutées sur le code dans `/cachecode` :
-
-```bash
-semgrep --config generated_rules/ /cachecode/user_project/
-```
-
-Output : rapport des vulnérabilités détectées dans le code de l'utilisateur.
+Les règles Semgrep validées sont renvoyées à l'utilisateur. Chaque règle contient :
+- L'ID de la CVE associée
+- Le pattern Semgrep
+- La sévérité (ERROR/WARNING/INFO)
+- Le message explicatif
+- Les métadonnées (CWE, package, langage)
 
 ---
 
@@ -184,15 +189,13 @@ from langgraph.graph import StateGraph, END
 
 graph = StateGraph(PipelineState)
 
-graph.add_node("enrich",    enrich_node)
 graph.add_node("generate",  generate_node)
 graph.add_node("critic",    critic_node)
 graph.add_node("execute",   execute_node)
 graph.add_node("classify",  classify_node)
 graph.add_node("store",     store_node)
 
-graph.set_entry_point("enrich")
-graph.add_edge("enrich", "generate")
+graph.set_entry_point("generate")
 graph.add_edge("generate", "critic")
 
 # Boucle interne : Critic décide
@@ -235,26 +238,32 @@ class PipelineState(TypedDict):
     temperature: float              # Temperature adaptative courante
 ```
 
-### LLMs via OpenRouter
+### LLMs — appels directs aux APIs
 
-OpenRouter comme routeur unifié — une seule API, accès à tous les providers.
+Chaque provider est appelé directement via son SDK, sans intermédiaire.
 
-| Rôle | Modèle recommandé | Pourquoi |
-|------|-------------------|----------|
-| **Generator** | `deepseek/deepseek-chat` ou `anthropic/claude-sonnet-4-5-20250929` | Doit produire du YAML Semgrep correct avec des patterns complexes |
-| **Critic** | `anthropic/claude-haiku-4-5-20251001` ou `google/gemini-2.0-flash` | Jugement structuré, modèle rapide et cheap suffisant |
+| Rôle | Modèle recommandé | Provider | Pourquoi |
+|------|-------------------|----------|----------|
+| **Generator** | `deepseek-chat` ou `claude-sonnet-4-5-20250929` | DeepSeek / Anthropic | Doit produire du YAML Semgrep correct avec des patterns complexes |
+| **Critic** | `claude-haiku-4-5-20251001` ou `gemini-2.0-flash` | Anthropic / Google | Jugement structuré, modèle rapide et cheap suffisant |
 
 Configuration :
 
 ```python
 @dataclass
 class LLMConfig:
-    openrouter_api_key: str
-    openrouter_base_url: str = "https://openrouter.ai/api/v1"
-    generator_model: str = "deepseek/deepseek-chat"
-    critic_model: str = "anthropic/claude-haiku-4-5-20251001"
-    generator_fallback: str = "anthropic/claude-sonnet-4-5-20250929"
+    # Generator
+    generator_provider: str = "deepseek"        # deepseek | anthropic | openai
+    generator_model: str = "deepseek-chat"
+    generator_api_key: str = ""
+
+    # Critic
+    critic_provider: str = "anthropic"
+    critic_model: str = "claude-haiku-4-5-20251001"
+    critic_api_key: str = ""
 ```
+
+Le code existant (`llm_provider.py`) supporte déjà les appels directs Anthropic, DeepSeek et OpenAI. Pas besoin de routeur intermédiaire.
 
 ### Monitoring : LangFuse (self-hosted)
 
@@ -303,19 +312,26 @@ with zipfile.ZipFile(upload_path) as z:
 ### Step 2 — DEPENDENCY TRACK
 
 **Input** : code source dans `/cachecode/`
-**Output** : liste de CVEs avec package, version vulnérable, commit(s) de fix
+**Output** : liste de CVEs avec package, version vulnérable, CWE, commit(s) de fix
 
-Détection des fichiers de dépendances, puis requête OSV par package + version :
+Détection des fichiers de dépendances, puis agrégation de 3 sources :
 
 ```python
-# Exemple : requête OSV
+# 1. OSV (Google) — versions affectées + fix commits
 POST https://api.osv.dev/v1/query
 {
     "package": {"name": "django", "ecosystem": "PyPI"},
     "version": "3.2.1"
 }
-# → retourne les CVEs affectant cette version + les fix commits
+
+# 2. GitHub Advisory — commits de fix + packages affectés
+GET https://api.github.com/advisories?affects=django@3.2.1
+
+# 3. NVD (NIST) — CWE, CVSS, description officielle
+GET https://services.nvd.nist.gov/rest/json/cves/2.0?cveId=CVE-2024-XXXXX
 ```
+
+Les résultats sont agrégés : CWE et CVSS de NVD, commits de fix de GitHub Advisory / OSV, versions affectées d'OSV.
 
 ### Step 3 — PATCH FETCH
 
@@ -377,20 +393,12 @@ vuln_matches == []                           → NO_MATCH_VULN
 fixed_matches != []                          → FALSE_POSITIVE
 ```
 
-### Step 8 — SCAN
+### Step 8 — RETURN
 
-**Input** : toutes les règles validées + code utilisateur dans `/cachecode/`
-**Output** : rapport de vulnérabilités
+**Input** : règle validée + métadonnées CVE
+**Output** : règle Semgrep renvoyée à l'utilisateur
 
-```bash
-semgrep --config generated_rules/ --json /cachecode/user_project/
-```
-
-Le rapport final contient pour chaque finding :
-- Le fichier et la ligne
-- La CVE associée
-- La sévérité
-- Le message explicatif
+La règle finale est stockée et renvoyée. Le pipeline s'arrête ici — pas de scan du code utilisateur. C'est à l'utilisateur de lancer Semgrep avec les règles générées s'il le souhaite.
 
 ---
 
@@ -426,7 +434,7 @@ function process_cve(cve_id, patch_diff, repo_path):
 
         if error_type is null:
             store(rule, cve_id)
-            return rule
+            return rule  // ← règle validée, renvoyée à l'utilisateur
 
         if error_type == PARSE_ERROR:
             return null  // non récupérable
@@ -453,11 +461,11 @@ function process_cve(cve_id, patch_diff, repo_path):
 | Composant | Outil | Rôle |
 |-----------|-------|------|
 | Orchestration | **LangGraph** | State machine avec boucles, conditional edges, checkpointing |
-| LLM Generator | **OpenRouter** → DeepSeek / Claude Sonnet | Génération de règles Semgrep |
-| LLM Critic | **OpenRouter** → Claude Haiku / Gemini Flash | Evaluation qualité + pertinence |
+| LLM Generator | **DeepSeek** / **Anthropic** (appels directs) | Génération de règles Semgrep |
+| LLM Critic | **Anthropic** / **Google** (appels directs) | Evaluation qualité + pertinence |
 | Monitoring | **LangFuse** (self-hosted) | Traces, tokens, coûts, scores |
 | Database | **SQLite** (dev) / **PostgreSQL** (prod) | Runs, checkpoints, règles |
 | Validation | **Semgrep CLI** | Exécution des règles sur le code |
 | Git | **GitPython** | Clone, checkout, diff |
-| CVE Data | **OSV API** + **GitHub Advisory** | Dependency tracking, patch discovery |
-| Code Input | **ZIP upload** → `/cachecode/` | Code utilisateur à scanner |
+| CVE Data | **NVD** + **GitHub Advisory** + **OSV** | Dependency tracking agrégé, patch discovery |
+| Code Input | **ZIP upload** → `/cachecode/` | Code utilisateur pour dependency tracking |
